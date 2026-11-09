@@ -11,19 +11,12 @@ TODO: -t  <hist> output job run time histogram to separate file
 TODO:  --clone       use cloning for hard cubes
 TODO:  --reduce      reduce learned clause cache after each job
 TODO:  --no-melt     do not melt unused assumption variables
-TODO:  --no-flush    do not flush learned clause cache before every job
-TODO:  --no-reverse  do not reverse assumptions
-TODO:  --deterministic | --det
-            jobs are mapped deterministically to workers
 TODO:  --no-add    do not add failed assumptions as don't care
 TODO:  -A  add all assumptions as don't care
 TODO:  <inccnf>    'p inccnf' + '<lit*> 0' clauses + 'a <lit>* 0' assumptions
 TODO:  <nworkers>  number of workers defaults to 1
 TODO:  -d|--drup   <path-prefix-for-traces>
-
-
 TODO:
-
 */
 
 #include <cassert>
@@ -79,7 +72,28 @@ static FILE *statsFile, *histFile;
 static double cumulatedTime = 0;
 static double cumulatedProcessTime = 0;
 
-static const int verbosity = 1;
+static const int verbosity = 0;
+// TODO: static int deterministicScheduling = 0;
+
+// Default: 1
+// --no-add: 0 -> do not add failed assumptions as don't care
+// -A: 2 -> 
+
+// TODO: static int addAssumptions = 1;
+
+// --reverse-assumptions: 1 -> Add the assumptions in reverse order
+// TODO: why? (but cadical does it too)
+static int noReverse = 0;
+
+// --no-flush: 1 -> do not flush learned clause cache before every job
+// by default the learned clause cache is flushed every time before a new job
+static int noFlush = 0;
+
+// --deterministic
+// each job gets assigned an id from [0, numWorkers]
+// each worker only takes jobs with the corresponding id
+static int deterministicScheduling = 0;
+static int numWorkers = 10;
 static int queue = 0;
 static std::mutex queueMutex;
 static int numCubes;
@@ -161,24 +175,34 @@ void readCNF(const Worker * worker, const char * filePath) {
 }
 
 void Worker::work() {
-    int jobId;
+    int last = -1;
     for (;;) {
         {
             const std::lock_guard<std::mutex> doneLock(doneMutex);
             if (satFound) break;
         }
-        {
+        if (!deterministicScheduling) {
             const std::lock_guard<std::mutex> queueLock(queueMutex);
-            if ((jobId = queue) >= numCubes) {
+            if ((last = queue) >= numCubes) {
                 msg(1, "worker has no available jobs. stopping the worker");
                 break;
             } else {
                 queue++;
             }
-        } // release queueLock
-        assert(jobId < numCubes);
-        msg(1, "got job %d", jobId);
-        auto currentAssumptions = cubes.at(jobId);
+        } else { // release queueLock
+            if (last == -1) last = id;
+            else last = last + numWorkers;
+            if (last >= numCubes) {
+                msg(1, "worker has no available jobs. stopping the worker");
+                break;
+            }
+        }
+        assert(last < numCubes);
+        msg(1, "got job %d", last);
+        auto currentAssumptions = cubes.at(last);
+        // reverse the assumptions
+        // looks like it is faster, but ... why?
+        if (!noReverse) std::reverse(currentAssumptions.begin(), currentAssumptions.end());
         // set new assumptions
         for (auto elem : currentAssumptions) {
             solver->assume(elem);
@@ -187,21 +211,32 @@ void Worker::work() {
         double solveStart = CaDiCaL::absolute_process_time();
         result = solver->solve();
         double solveDelta = CaDiCaL::absolute_process_time() - solveStart;
-        msg(1, "finished with solving job %d with result: %d", jobId, result);
+        msg(1, "finished with solving job %d with result: %d", last, result);
         // we don't have to reset as the Cadical solve()-method does it already
+        // TODO: but still faster? no only measurement error
         // solver->reset_assumptions();
         if (result == CaDiCaL::Status::SATISFIABLE) {
-            msg(0, "%sCUBE %d SATISFIABLE%s in %.3f sec %s", CaDiCaL::tout.green_code(), jobId, CaDiCaL::tout.magenta_code(), solveDelta, CaDiCaL::tout.normal_code());
+            msg(0, "%sCUBE %d SATISFIABLE%s in %.3f sec %s", CaDiCaL::tout.green_code(), last, CaDiCaL::tout.magenta_code(), solveDelta, CaDiCaL::tout.normal_code());
             const std::lock_guard<std::mutex> doneLock(doneMutex);
             winningWorker = this;
             satFound = true;
             break;
         } else if (result == CaDiCaL::Status::UNSATISFIABLE) {
-            msg(0, "%sCUBE %d UNSATISFIABLE%s in %.3f sec %s", CaDiCaL::tout.cyan_code(), jobId, CaDiCaL::tout.magenta_code(), solveDelta, CaDiCaL::tout.normal_code());
+            msg(0, "%sCUBE %d UNSATISFIABLE%s in %.3f sec %s", CaDiCaL::tout.cyan_code(), last, CaDiCaL::tout.magenta_code(), solveDelta, CaDiCaL::tout.normal_code());
         } else {
-            msg(0, "%sCUBE %d inconclusive%s in %.3f sec %s", CaDiCaL::tout.magenta_code(), jobId, CaDiCaL::tout.magenta_code(), solveDelta, CaDiCaL::tout.normal_code());
+            msg(0, "%sCUBE %d inconclusive%s in %.3f sec %s", CaDiCaL::tout.magenta_code(), last, CaDiCaL::tout.magenta_code(), solveDelta, CaDiCaL::tout.normal_code());
+        }
+        // deleting the whole solver state brings considerable speedup
+        // there is no option in Cadical to delete the learned clauses
+        // so we have to copy it
+        if (!noFlush) {
+            auto newSolver = new CaDiCaL::Solver;
+            solver->copy(*newSolver);
+            std::swap(solver, newSolver);
+            delete newSolver;
         }
     }
+    stopWorker();
     msg(1, "worker has finished");
 }
 
@@ -209,16 +244,17 @@ int main(int argc, char ** argv) {
     // First we create the thread pool
     // Default number of workers is just the amount of logical processors we have
     // TODO: add cli parameter to set it by hand
-    int threadCount = std::thread::hardware_concurrency();
-    threadCount = 128;
+    // int threadCount = std::thread::hardware_concurrency();
     Worker mainWorker(-1);
+    printf("flush? %d", mainWorker.solver->get("flush"));
+    // return 0;
     readCNF(&mainWorker, "../sat-benchmarks/icnf/sgen1-sat-160-100.icnf");
     _msg(1, "%d cubes parsed", numCubes);
     double time = CaDiCaL::absolute_real_time();
     _msg(0, "time %f", time);
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < threadCount; i++) {
+    for (int i = 0; i < numWorkers; i++) {
         threads.emplace_back([i, &mainWorker] {
             Worker worker(i);
             // workers.emplace_back(worker);
