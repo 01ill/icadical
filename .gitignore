@@ -2,3 +2,11 @@ tmp
 *.dSYM
 *.out
 build
+.idea
+.vscode
+.zed
+icnf
+*.o
+*.log
+.cache
+.DS_Store
