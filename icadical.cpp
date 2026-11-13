@@ -14,6 +14,7 @@ TODO:  -d|--drup   <path-prefix-for-traces>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdarg>
 #include <cstdio>
 #include <memory>
 #include <mutex>
