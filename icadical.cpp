@@ -5,14 +5,12 @@ TODO: maybe dont use the terminator if performance is bad. also explore the cadi
 
 TODO: -q  do not print 'c job ...' lines (requires verbosity < 2)
 TODO: -s  <stats> output statistics to separate file
-TODO: -t  <hist> output job run time histogram to separate file
 TODO:  --clone       use cloning for hard cubes
 TODO:  --reduce      reduce learned clause cache after each job
 TODO:  --no-melt     do not melt unused assumption variables
 TODO:  -d|--drup   <path-prefix-for-traces>
-TODO: pass the limits (see cadical incremental)
 */
-
+// #define NDEBUG
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -146,6 +144,7 @@ static std::atomic<int> queue(0);
 static std::mutex msgMutex;
 
 static std::vector<std::vector<int>> cubes;
+static std::vector<std::vector<int>> failedAssumptions;
 static std::vector<Worker *> workers;
 static Worker * winningWorker;
 
@@ -283,7 +282,24 @@ void Worker::work() {
         }
         assert(jobId < numCubes);
         msg(1, "got job %d", jobId);
-        auto & currentAssumptions = cubes.at(jobId);
+
+        // replay all the assumptions
+        // TODO: currently this just negates all variables in the previous assumptions
+        // would be a bit nicer to also just take the failed ones
+        // as cadical has only one thread working it replays all failed assumptions
+        // TODO: check deterministic mode with this!
+        assert(lastJob != jobId);
+        if (options.allAssumptions.get()) {
+            for (auto it = failedAssumptions.begin() + lastJob + 1; it < failedAssumptions.begin() + jobId; it++) {
+                if (!it->empty()) {
+                    for (auto lit : *it) {
+                        solver->add(-lit);
+                    }
+                }
+            }
+        }
+
+        auto & currentAssumptions = cubes[jobId];
         // reverse the assumptions
         // looks like it is faster, but ... why?
         if (!options.noReverse.get()) std::reverse(currentAssumptions.begin(), currentAssumptions.end());
@@ -317,6 +333,40 @@ void Worker::work() {
         if (options.progressBar.get()) {
             showProgress();
         }
+
+        // find out the failed core
+        // the failed core is added as a 'learned clause' to the solver
+        // will be preserved by copy() as the irredundant clauses are copied
+        // if it is redundant then we dont care anyways
+        if (!options.noAssumptions.get()) {
+            if (result == CaDiCaL::Status::UNSATISFIABLE) {
+                assert(solver->state() == CaDiCaL::State::UNSATISFIED);
+                // std::vector<int> failedAssumptions;
+                for (auto lit : currentAssumptions) {
+                    if (solver->failed(lit)) {
+                        failedAssumptions[jobId].push_back(lit);
+                        // failedAssumptions.push_back(lit);
+                        // solver->add(-lit); (changes the solver state ...)
+                    }
+                }
+                for (auto lit : failedAssumptions[jobId]) {
+                    solver->add(-lit);
+                }
+                if (!failedAssumptions[jobId].empty()) {
+                    solver->add(0);
+                    failedAssumptions[jobId].push_back(0);
+                }
+                // failedAssumptions.clear();
+            }
+        }
+
+        // TODO: what does this do?
+        // solver.cpp:1328 (calls conclude_sat, ...)
+        // assume.cpp:461: conclude_unsat:
+        // passes it to the proof tracer
+        // TODO: if proof tracing is wanted this is needed probably
+        // solver->conclude();
+
         // deleting the whole solver state brings considerable speedup
         // there is no option in Cadical to delete the learned clauses
         // so we have to copy it
@@ -380,6 +430,10 @@ int main(int argc, char ** argv) {
             options.noFlush.set(1);
         } else if (arg == "--no-reverse") {
             options.noReverse.set(1);
+        } else if (arg == "--no-assumptions") {
+            options.noAssumptions.set(1);
+        } else if (arg == "--all-assumptions") {
+            options.allAssumptions.set(1);
         } else if (arg == "--deterministic") {
             options.deterministicScheduling.set(1);
         } else if (arg == "--decision-limit" || arg == "-d") {
@@ -457,9 +511,10 @@ int main(int argc, char ** argv) {
         options.proofPath.set(positionalPaths.at(1));
     }
 
-    // if (options.icnfPath.get() == "stdin") {
-    //     options.icnfPath.set("../sat-benchmarks/icnf/sgen1-sat-160-100.icnf");
-    // }
+    if (options.allAssumptions.get() && options.noAssumptions.get()) {
+        error("parse error: --all-assumptions and --no-assumptions can't be used together" );
+        return 1;
+    }
 
     section(0, "banner", false);
 
@@ -496,7 +551,9 @@ int main(int argc, char ** argv) {
         mainWorker.result = mainWorker.solver->solve();
         winningWorker = &mainWorker;
     } else {
+        // initialize global vectors
         cubeTimes.assign(numCubes, -1.0);
+        failedAssumptions.assign(numCubes, std::vector<int>());
 
         section(0, "incremental solving");
         _msg(0, "starting to solve %d cubes with %d workers\nc", numCubes, options.numWorkers.get());
@@ -608,5 +665,6 @@ int main(int argc, char ** argv) {
 
     section(0, "shutting down");
     _msg(0, "%d\nc", winningWorker->result);
-    exit(winningWorker->result);
+    return winningWorker->result;
+    // exit(winningWorker->result);
 }

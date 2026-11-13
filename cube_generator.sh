@@ -28,7 +28,7 @@ if [ ! -d "$OUT_DIR" ] ; then
 fi
 
 if ! command -v "march_cu" ; then
-    echo "march_cu not found. it needs to be in the directory or the path!"
+    echo "march_cu not found. it needs to be in the directory or the path!" >&2
     exit 1
 fi
 
