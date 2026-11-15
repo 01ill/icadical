@@ -3,7 +3,6 @@ TODO: Clone-Funktionalität
 TODO: Cadical-Optionen weitergeben
 TODO: maybe dont use the terminator if performance is bad. also explore the cadical options for it
 
-TODO: -q  do not print 'c job ...' lines (requires verbosity < 2)
 TODO: -s  <stats> output statistics to separate file
 TODO:  --clone       use cloning for hard cubes
 TODO:  --reduce      reduce learned clause cache after each job
@@ -11,7 +10,6 @@ TODO:  --no-melt     do not melt unused assumption variables
 TODO:  -d|--drup   <path-prefix-for-traces>
 */
 // #define NDEBUG
-#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstdarg>
@@ -40,6 +38,7 @@ struct iCadicalOption {
 };
 
 struct Options {
+    iCadicalOption<int> quiet{"quiet", "do not print messages from the workers", 0};
     iCadicalOption<int> verbosity{"verbosity", "sets the verbose level", 0};
     iCadicalOption<int> progressBar{"progress-bar", "shows a progress bar and silences all output", 0};
     // int verbosity = 0;
@@ -84,7 +83,7 @@ struct Options {
     Options() {
         stringOptions = { &icnfPath, &proofPath, &statsPath, &histPath };
         intOptions = { &verbosity, &progressBar, &noReverse, &noFlush,
-            &freezeCubes, &conflictLimit, &decisionLimit,
+            &freezeCubes, &conflictLimit, &decisionLimit, &quiet,
             &noAssumptions, &allAssumptions, &noMelt,  &deterministicScheduling, &numWorkers,
         };
     }
@@ -104,6 +103,7 @@ struct Worker : CaDiCaL::Terminator {
     FILE *proof, *post;
     int *failed, numFailed;
     std::unique_ptr<CaDiCaL::Solver> solver;
+    Worker() = delete; // MUST always have an id so forbid default constructor
     Worker (const int i) : id(i), solver(new CaDiCaL::Solver) { }
     ~Worker() {
         // with unique_ptr the solver is deleted automatically after we destruct our Worker
@@ -143,7 +143,9 @@ static std::atomic<int> solvedCubes(0);
 static std::atomic<bool> satFound(false);
 static std::atomic<int> queue(0);
 static std::mutex msgMutex;
+static std::mutex assumptionMutex;
 
+// TODO: als pair und dann eine bitmask für die conflict literals?
 static std::vector<std::vector<int>> cubes;
 static std::vector<std::vector<int>> failedAssumptions;
 static std::vector<Worker *> workers;
@@ -208,6 +210,7 @@ static void section(int level, const char * title, bool lineBefore = true) {
 }
 
 void Worker::msg(int level, const char *fmt, ...) const {
+    if (options.quiet.get()) return;
     va_list ap;
     va_start(ap, fmt);
     __msg(this, level, fmt, ap);
@@ -258,7 +261,7 @@ static bool readCNF(const Worker * worker, const char * filePath) {
             numCubes++;
             lastElem = 0;
         } else {
-            cubes.at(numCubes).emplace_back((lastElem = elem));
+            cubes[numCubes].emplace_back((lastElem = elem));
         }
     }
     assumptions.clear();
@@ -270,12 +273,13 @@ void Worker::work() {
     while (true) {
         if (satFound.load()) break;
         if (!options.deterministicScheduling.get()) {
-            if ((jobId = queue.load()) < numCubes) {
-                queue.fetch_add(1);
-            }
-        } else {
             if (jobId == -1) jobId = id;
             else jobId = jobId + options.numWorkers.get();
+        } else {
+            jobId = queue.fetch_add(1);
+            // if ((jobId = queue.load()) < numCubes) {
+            //     queue.fetch_add(1);
+            // }
         }
         if (jobId >= numCubes) {
             msg(1, "worker has no available jobs. stopping the worker");
@@ -291,23 +295,40 @@ void Worker::work() {
         // TODO: check deterministic mode with this!
         assert(lastJob != jobId);
         if (options.allAssumptions.get()) {
-            for (auto it = failedAssumptions.begin() + lastJob + 1; it < failedAssumptions.begin() + jobId; it++) {
+            std::lock_guard<std::mutex> assumptionGuard(assumptionMutex);
+            for (auto it = failedAssumptions.begin() + lastJob + 1; it < failedAssumptions.begin() + jobId; ++it) {
                 if (!it->empty()) {
-                    for (auto lit : *it) {
-                        solver->add(-lit);
+                    solver->clause(*it);
+                }
+            }
+        }
+
+        if (!options.noMelt.get()) {
+            std::lock_guard<std::mutex> assumptionGuard(assumptionMutex);
+            for (auto it = failedAssumptions.begin() + lastJob + 1; it < failedAssumptions.begin() + jobId; ++it) {
+                if (!it->empty()) {
+                    for (int lit : *it) {
+                        // if (used abs(lit)) {}
+                        solver->melt(-lit); // stored as -lit so reverse
                     }
                 }
             }
         }
 
-        auto & currentAssumptions = cubes[jobId];
+        // no guard needed as only read in the threads
+        auto const & currentAssumptions = cubes[jobId];
         // reverse the assumptions
         // looks like it is faster, but ... why?
-        if (!options.noReverse.get()) std::reverse(currentAssumptions.begin(), currentAssumptions.end());
-        // set new assumptions
-        for (auto elem : currentAssumptions) {
-            solver->assume(elem);
-            msg(2, "assume %d", elem);
+        if (options.noReverse.get()) {
+            for (auto it = currentAssumptions.begin(); it < currentAssumptions.end(); ++it) {
+                solver->assume(*it);
+                msg(2, "assume %d", *it);
+            }
+        } else {
+            for (auto it = currentAssumptions.rbegin(); it < currentAssumptions.rend(); ++it) {
+                solver->assume(*it);
+                msg(2, "assume %d", *it);
+            }
         }
         double solveStart = CaDiCaL::absolute_real_time();
         result = solver->solve();
@@ -342,22 +363,22 @@ void Worker::work() {
         if (!options.noAssumptions.get()) {
             if (result == CaDiCaL::Status::UNSATISFIABLE) {
                 assert(solver->state() == CaDiCaL::State::UNSATISFIED);
-                // std::vector<int> failedAssumptions;
+                std::vector<int> _failedAssumptions;
                 for (auto lit : currentAssumptions) {
                     if (solver->failed(lit)) {
-                        failedAssumptions[jobId].push_back(lit);
+                        _failedAssumptions.push_back(-lit);
                         // failedAssumptions.push_back(lit);
                         // solver->add(-lit); (changes the solver state ...)
                     }
                 }
-                for (auto lit : failedAssumptions[jobId]) {
-                    solver->add(-lit);
+                if (!_failedAssumptions.empty()) {
+                    // _failedAssumptions.push_back(0);
+                    solver->clause(_failedAssumptions);
+                    std::lock_guard<std::mutex> assumptionGuard(assumptionMutex);
+                    failedAssumptions[jobId] = _failedAssumptions;
                 }
-                if (!failedAssumptions[jobId].empty()) {
-                    solver->add(0);
-                    failedAssumptions[jobId].push_back(0);
-                }
-                // failedAssumptions.clear();
+                _failedAssumptions.clear();
+
             }
         }
 
@@ -398,8 +419,9 @@ int main(int argc, char ** argv) {
     }
     std::vector<std::string> args(argv, argv + argc);
     std::vector<std::string> positionalPaths;
+    int _verbosity = 0;
     for (int i = 1; i < static_cast<int>(args.size()); i++) {
-        std::string & arg = args.at(i);
+        std::string & arg = args[i];
         // like cadical: if "-" or no path is supplied we take the stdin
         // TODO: actually take the stdin then
         if (arg[0] != '-' || arg.size() == 1) {
@@ -410,8 +432,11 @@ int main(int argc, char ** argv) {
             printUsage();
             return 0;
         } else if (arg == "-v") {
-            options.verbosity.val++;
-        } else if (arg == "--num-workers") {
+            _verbosity++;
+        } else if (arg == "--quiet" || arg ==  "-q") {
+            options.quiet.set(1);
+        }
+        else if (arg == "--num-workers") {
             // we have to check the next arg
             if (argc <= ++i) {
                 error("parse error: num-workers needs a numeric amount of workers supplied");
@@ -435,6 +460,10 @@ int main(int argc, char ** argv) {
             options.noAssumptions.set(1);
         } else if (arg == "--all-assumptions") {
             options.allAssumptions.set(1);
+        } else if (arg == "--freeze") {
+            options.freezeCubes.set(1);
+        } else if (arg == "--no-melt") {
+            options.noMelt.set(1);
         } else if (arg == "--deterministic") {
             options.deterministicScheduling.set(1);
         } else if (arg == "--decision-limit" || arg == "-d") {
@@ -488,8 +517,6 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-
-
         // all options which are unknown are assummed to be passed to cadical
         else {
             if (mainWorker.solver->is_valid_long_option(arg.c_str())) {
@@ -501,21 +528,34 @@ int main(int argc, char ** argv) {
         }
     }
 
+    options.verbosity.set(_verbosity);
+
     if (positionalPaths.size() > 2) {
-        std::printf("error: too many positional parameters supplied! wont continue!\n");
+        error("parse error: too many positional parameters supplied! wont continue!");
         return 1;
     }
     if (positionalPaths.size() > 0) {
-        options.icnfPath.set(positionalPaths.at(0));
+        options.icnfPath.set(positionalPaths[0]);
     }
     if (positionalPaths.size() > 1) {
-        options.proofPath.set(positionalPaths.at(1));
+        options.proofPath.set(positionalPaths[1]);
     }
 
     if (options.allAssumptions.get() && options.noAssumptions.get()) {
-        error("parse error: --all-assumptions and --no-assumptions can't be used together" );
+        error("parse error: --all-assumptions and --no-assumptions can't be used together");
         return 1;
     }
+
+    if (options.noMelt.get() && !options.freezeCubes.get()) {
+        error("parse error: --no-melt is only respected when used with --freeze");
+        return 1;
+    }
+
+    options.cadicalOptions.push_back("--reducetier1glue=3");
+    options.cadicalOptions.push_back("--reduceinit=1000");
+    options.cadicalOptions.push_back("--reduceint=1000");
+    options.cadicalOptions.push_back("--restartresusetrail=true"); // true by default but why not...
+    options.cadicalOptions.push_back("--flush=true"); // TODO: on copy anyways flushed so useless?
 
     section(0, "banner", false);
 
@@ -533,21 +573,21 @@ int main(int argc, char ** argv) {
     if (!options.cadicalOptions.empty()) {
         std::printf("c Passing the following settings to CaDiCaL:\n");
         for (auto &option : options.cadicalOptions) {
+            // TODO: actually set the option...
+            mainWorker.solver->set_long_option(option.c_str());
             std::printf("c  %s\n", option.c_str());
         }
     }
 
     section(0, "parsing input");
 
-
     if (!readCNF(&mainWorker, options.icnfPath.get().c_str())) {
         error("couldnt read file %s. stopping!", options.icnfPath.get().c_str());
         return 1;
     }
 
-    // TODO: this should be tested
     if (!numCubes) {
-        std::printf("c no cubes could be parsed. continuing to solve with CaDiCaL\n");
+        std::printf("c no cubes could be parsed. continuing to solve with a single worker\n");
         options.numWorkers.set(0);
         mainWorker.result = mainWorker.solver->solve();
         winningWorker = &mainWorker;
@@ -559,7 +599,6 @@ int main(int argc, char ** argv) {
         section(0, "incremental solving");
         _msg(0, "starting to solve %d cubes with %d workers\nc", numCubes, options.numWorkers.get());
         for (int i = 0; i < options.numWorkers.get(); i++) {
-            // Worker worker(i);
             workers.push_back(new Worker(i));
             workers[i]->initWorker(&mainWorker);
             int highestVar = mainWorker.solver->vars();
@@ -581,9 +620,11 @@ int main(int argc, char ** argv) {
         for (auto & t : threads) {
             t.join();
         }
+
         if (options.progressBar.get()) {
             showProgress(true);
         }
+
         section(0, "incremental summary");
 
         // TODO: does inconclusive count as solved?
@@ -603,6 +644,7 @@ int main(int argc, char ** argv) {
         for (auto & worker : workers) {
             if (!winningWorker) {
                 winningWorker = worker;
+                _msg(1, "worker %d is the winning worker", winningWorker->id);
                 continue;
             }
             if (worker->result == CaDiCaL::Status::SATISFIABLE) {
