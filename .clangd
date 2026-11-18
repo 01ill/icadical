@@ -1,0 +1,28 @@
+CompileFlags:
+  Add:
+    - -g
+    - -Wall
+    - -Wextra
+    - -O3
+    - -std=c++11
+    - -pthread
+    - -pedantic
+
+Diagnostics:
+  UnusedIncludes: None
+  ClangTidy:
+    Add:
+      - bugprone-*
+      - performance-*
+      - portability-*
+
+InlayHints:
+  Enabled: true
+  ParameterNames: true
+  DeducedTypes: true
+
+Index:
+  Background: Build
+
+Completion:
+  MacroFilter: FuzzyMatch
