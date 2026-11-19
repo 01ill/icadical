@@ -1,6 +1,6 @@
 BasedOnStyle: LLVM
 AlignEscapedNewlines: DontAlign
-ColumnLimit: 160
+ColumnLimit: 79
 SpaceBeforeParens: ControlStatements
 SpaceAfterCStyleCast: true
 InsertBraces: true

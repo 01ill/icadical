@@ -10,3 +10,5 @@ icnf
 *.log
 .cache
 .DS_Store
+cadical
+icadical.xcodeproj
