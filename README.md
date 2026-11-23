@@ -35,3 +35,21 @@ For the full list of options run:
 ```bash
 ./build/icadical --help
 ```
+
+# ccadical
+ccadical is a frontend for cube creation using CaDiCaLs lookahead function.
+
+## Usage
+The project is built with `clang++` and a simple makefile. To run it you have to do the following:
+```bash
+make
+./build/ccadical <options>  <cnf file> <icnf file>
+```
+
+To generate an icnf with cubes from a sample cnf file with cubing depth of 5 run the following:
+```bash
+./build/ccadical --depth 5 samples/test.cnf samples/test.icnf
+```
+
+Currently the following options exist:
+- `--depth <cube depth>` the maximum amount of variables in each cube. might be smaller if the lookahead in Cadical already solves some subformula.
