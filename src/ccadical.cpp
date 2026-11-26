@@ -157,7 +157,8 @@ struct DecisionTree {
     }
 };
 
-static int build_decision_tree(CaDiCaL::Solver * solver, std::vector<std::vector<int>> &cubes, int max_depth = 10, float rand_factor = 0.5) {
+
+static int build_decision_tree_dynamic(CaDiCaL::Solver * solver, std::vector<std::vector<int>> &cubes, int max_depth = 10, float rand_factor = 0.5) {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<> distr(0, 1);
@@ -266,6 +267,116 @@ static int build_decision_tree(CaDiCaL::Solver * solver, std::vector<std::vector
     return 0;
 }
 
+static int build_decision_tree_static(CaDiCaL::Solver * solver, std::vector<std::vector<int>> &cubes, int max_depth = 10, float rand_factor = 0.5) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<> distr(0, 1);
+    std::vector<int> assumptions{};
+    DecisionTree dt = DecisionTree();
+    int depth = 0;
+    int node_idx = 0;
+    bool backtrack = false;
+    // cant get any longer
+    std::vector<int> chain(max_depth, 0);
+    while (true) {
+        TreeNode parent_node = dt.nodes[node_idx];
+        if (backtrack) {
+            std::printf("backtrack at depth %d\n", depth);
+            std::printf("node: lit: %d, parent: %d, left: %d, right: %d\n", parent_node.lit, parent_node.parent, parent_node.left, parent_node.right);
+
+            // we've hit a stop so we must reset all assumptions
+            // (cadical provides no granular control over assumptions)
+            solver->reset_assumptions();
+            // leaf nodes also have -1 in their childs so backtrack at least once
+            do {
+                depth--;
+                node_idx = dt.nodes[node_idx].parent;
+
+            } while (dt.nodes[node_idx].right != -1 && node_idx != 0);
+            parent_node = dt.nodes[node_idx];
+            std::printf("backtrack finished at depth %d. backtracked to:\n", depth);
+            std::printf("node: lit: %d, parent: %d, left: %d, right: %d\n", parent_node.lit, parent_node.parent, parent_node.left, parent_node.right);
+            backtrack = false;
+
+            if (node_idx == 0 && parent_node.right != -1 && parent_node.left != -1) {
+                break;
+            }
+        }
+
+        // reached max depth: set cutoff leaf and backtrack
+        // max_depth "=" levels, i.e. stops after depth -1
+        if (depth >= max_depth) {
+            std::printf("reached max depth %d. GENERATED CUBE: ", depth);
+            assumptions.clear();
+            for (int i = 0; i < depth; i++) {
+                std::printf("%d ", chain[i]);
+                assumptions.push_back(chain[i]);
+            }
+            cubes.push_back(assumptions);
+            std::printf("\n");
+            backtrack = true;
+            continue;
+        }
+
+
+        // we dont have any child nodes so create new ones and
+        if (parent_node.left == -1) {
+            int splitter = solver->lookahead();
+            std::printf("lookahead: %d\n", splitter);
+
+            // splitter solved the formula: might be SAT, UNSAT or inconclusive when empty formula
+            // if SAT we can end it all
+            // if UNSAT we can refute the leaf
+            // else ??? (for now assert that it doesnt happen ...)
+            if (splitter == 0) {
+                if (solver->state() == CaDiCaL::State::SATISFIED) {
+                    return CaDiCaL::Status::SATISFIABLE;
+                } else if (solver->state() == CaDiCaL::State::UNSATISFIED) {
+                    depth = 0;
+                    node_idx = 0;
+                    backtrack = true;
+                    continue;
+                }
+                assert(solver->state() != CaDiCaL::State::INCONCLUSIVE);
+            }
+
+            TreeNode left = TreeNode();
+            left.parent = node_idx;
+            left.lit = splitter;
+            dt.nodes.emplace_back(left);
+            dt.nodes[node_idx].left = static_cast<int>(dt.nodes.size() - 1);
+            node_idx = static_cast<int>(dt.nodes.size() - 1);
+
+            for (int i = 0; i < depth; i++) {
+                solver->assume(chain[i]);
+            }
+            solver->assume(splitter);
+            std::printf("assuming %d at depth %d\n", splitter, depth);
+            chain[depth] = splitter;
+        } else if (parent_node.right == -1) {
+            int value = dt.nodes[parent_node.left].lit;
+            TreeNode right = TreeNode();
+            right.parent = node_idx;
+            right.lit = -value;
+            dt.nodes.emplace_back(right);
+            dt.nodes[node_idx].right = static_cast<int>(dt.nodes.size() - 1);
+            node_idx = static_cast<int>(dt.nodes.size() - 1);
+
+            for (int i = 0; i < depth; i++) {
+                solver->assume(chain[i]);
+            }
+            solver->assume(-value);
+            std::printf("assuming %d at depth %d\n", -value, depth);
+            chain[depth] = -value;
+        }
+        depth++;
+    }
+    std::printf("finished building decision tree\n");
+    dt.print_tree();
+    return 0;
+}
+
+
 static bool write_icnf(const char *in_path, const char *out_path, const std::vector<std::vector<int>> &cubes) {
     std::ifstream in(in_path);
     std::ofstream out(out_path);
@@ -292,9 +403,122 @@ static bool write_icnf(const char *in_path, const char *out_path, const std::vec
     return static_cast<bool>(out);
 }
 
+static void localsearch_test(CaDiCaL::Solver * solver) {
+    // solver->set_long_option("--quiet=0");
+    // solver->set_long_option("--verbose=3");
+    solver->limit("localsearch", 50);
+    solver->limit("conflicts", 0);
+    int res = solver->solve();
+    std::printf("res: %d\n", res);
+    std::printf("%d\n", solver->saved_phase(1));
+    std::printf("%d\n", solver->saved_phase(2));
+    std::vector<int> most_flips = solver->localsearch_most_flipped(10);
+    for (auto flip : most_flips) {
+        std::printf("count: %d\n", flip);
+    }
+    std::printf("\n");
+
+    // solver->statistics();
+}
+
+static int
+localsearch_static_tree(CaDiCaL::Solver * solver,
+                        std::vector<std::vector<int>> & cubes, int depth,
+                        int rounds) {
+    solver->limit("localsearch", rounds);
+    solver->limit("conflicts", 0);
+    int res = solver->solve();
+    std::vector<int> most_flips = solver->localsearch_most_flipped(depth);
+    for (auto flip : most_flips) {
+        std::printf("count: %d\n", flip);
+    }
+    std::printf("\n");
+    std::vector<int> assumptions{};
+    DecisionTree dt = DecisionTree();
+    int node_idx = 0;
+    int current_depth = 0;
+    bool backtrack = false;
+    // cant get any longer
+    std::vector<int> chain(depth, 0);
+    while (true) {
+        TreeNode parent_node = dt.nodes[node_idx];
+        if (backtrack) {
+            std::printf("backtrack at depth %d\n", current_depth);
+            std::printf("node: lit: %d, parent: %d, left: %d, right: %d\n",
+                        parent_node.lit, parent_node.parent, parent_node.left,
+                        parent_node.right);
+
+            // leaf nodes also have -1 in their childs so backtrack at least
+            // once
+            do {
+                current_depth--;
+                node_idx = dt.nodes[node_idx].parent;
+
+            } while (dt.nodes[node_idx].right != -1 && node_idx != 0);
+            parent_node = dt.nodes[node_idx];
+            std::printf("backtrack finished at depth %d. backtracked to:\n",
+                        current_depth);
+            std::printf("node: lit: %d, parent: %d, left: %d, right: %d\n",
+                        parent_node.lit, parent_node.parent, parent_node.left,
+                        parent_node.right);
+            backtrack = false;
+
+            if (node_idx == 0 && parent_node.right != -1 &&
+                parent_node.left != -1) {
+                break;
+            }
+        }
+
+        // reached max depth: set cutoff leaf and backtrack
+        // max_depth "=" levels, i.e. stops after depth -1
+        if (current_depth >= depth) {
+            std::printf("reached max depth %d. GENERATED CUBE: ",
+                        current_depth);
+            assumptions.clear();
+            for (int i = 0; i < current_depth; i++) {
+                std::printf("%d ", chain[i]);
+                assumptions.push_back(chain[i]);
+            }
+            cubes.push_back(assumptions);
+            std::printf("\n");
+            backtrack = true;
+            continue;
+        }
+
+        // we dont have any child nodes so create new ones and
+        if (parent_node.left == -1) {
+            int splitter = most_flips[current_depth];
+            std::printf("lookahead: %d\n", splitter);
+
+            TreeNode left = TreeNode();
+            left.parent = node_idx;
+            left.lit = splitter;
+            dt.nodes.emplace_back(left);
+            dt.nodes[node_idx].left = static_cast<int>(dt.nodes.size() - 1);
+            node_idx = static_cast<int>(dt.nodes.size() - 1);
+            chain[current_depth] = splitter;
+            std::printf("assuming %d at depth %d\n", splitter, current_depth);
+        } else if (parent_node.right == -1) {
+            int value = dt.nodes[parent_node.left].lit;
+            TreeNode right = TreeNode();
+            right.parent = node_idx;
+            right.lit = -value;
+            dt.nodes.emplace_back(right);
+            dt.nodes[node_idx].right = static_cast<int>(dt.nodes.size() - 1);
+            node_idx = static_cast<int>(dt.nodes.size() - 1);
+            chain[current_depth] = -value;
+            std::printf("assuming %d at depth %d\n", -value, current_depth);
+        }
+        current_depth++;
+    }
+    std::printf("finished building decision tree\n");
+    dt.print_tree();
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     CaDiCaL::Solver * solver = new CaDiCaL::Solver;
-    solver->set_long_option("--quiet");
+    solver->set_long_option("--verbose=3");
     std::vector<std::string> args(argv, argv + argc);
     std::vector<std::string> positionalPaths;
     int _verbosity = 0;
@@ -404,43 +628,14 @@ int main(int argc, char ** argv) {
               options.cnfPath.get().c_str());
         return 1;
     }
-
-
-    // mainWorker.solver->simplify();
-    // int result = solver->solve();
-    int result =0 ;
-    // int lookaheadResult = solver->lookahead();
-    // solver->assume(-lookaheadResult);
-    // int la2 = solver->lookahead();
-    // solver->assume(-la2);
-    // CaDiCaL::Solver::CubesWithStatus generatedCubes = solver->generate_cubes(10, 11);
-
-    // for (auto const & cube : generatedCubes.cubes) {
-    //     for (auto assumption : cube) {
-    //         std::printf("%d ", assumption);
-    //     }
-    //     std::printf("\n");
-    // }
-
-    // _msg(0, "lookahead result: %d %d, cube status: %d", lookaheadResult, la2, generatedCubes.status);
-    // _msg(0, "%d", solver->state());
     std::vector<std::vector<int>> cubes;
-    build_decision_tree(solver, cubes, options.depth.get());
+    // localsearch_test(solver);
+    localsearch_static_tree(solver, cubes, 10, 50);
     std::printf("generated cubes: %zu\n", cubes.size());
     write_icnf(options.cnfPath.get().c_str(), options.icnfPath.get().c_str(), cubes);
-    // section(0, "result");
 
-    // // section(0, "statistics");
-    // // solver->statistics();
-
-    // section(0, "resources");
-    // _msg(0, "total process time since initialization: %.2f\tseconds",
-    //      CaDiCaL::absolute_process_time() - totalStartTimeProcess);
-    // _msg(0, "total real time since initialization: %.2f\tseconds",
-    //      CaDiCaL::absolute_real_time() - totalStartTime);
-
-    // section(0, "shutting down");
-    // _msg(0, "%d\nc", result);
+    int result = 0;
+    // build_decision_tree_dynamic(solver, cubes, options.depth.get());
+    // write_icnf(options.cnfPath.get().c_str(), options.icnfPath.get().c_str(), cubes);
     return result;
-    // exit(winningWorker->result);
 }

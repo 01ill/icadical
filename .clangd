@@ -5,6 +5,8 @@ Diagnostics:
       - bugprone-*
       - performance-*
       - portability-*
+    Remove:
+      - bugprone-easily-swappable-parameters
 
 InlayHints:
   Enabled: true
